@@ -16,7 +16,7 @@
 # Код первой команды конвейера важен только в run(), и там читается PIPESTATUS.
 set -u
 
-VERSION="1.0"
+VERSION="1.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")"
 LOG_FILE="/var/log/ubuntu-setup.log"
 export DEBIAN_FRONTEND=noninteractive
@@ -1641,6 +1641,55 @@ mod_docker() {
     fi
 }
 
+# Свежий Portainer (с версии 2.43) не создаёт первую учётку без setup_token.
+# Токен одноразовый и попадает в лог контейнера строкой setup_token=ЗНАЧЕНИЕ
+# (в JSON-логе — "setup_token":"ЗНАЧЕНИЕ"). Без него панель просит достать
+# токен из docker logs. Берём последнее вхождение: после перезапуска выше
+# по файлу остаётся уже недействительный токен.
+portainer_token_from_logs() {
+    local logs=$1 line token=''
+    local re='setup_token"?[[:space:]]*[=:][[:space:]]*"?([A-Za-z0-9._~+/=-]{8,})'
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line//$'\r'/}
+        # В [[ ]] последовательность ]] из класса [:alpha:] рвёт условие,
+        # поэтому цветовые коды снимает sed.
+        line=$(printf '%s' "$line" | sed $'s/\033\\[[0-9;]*[[:alpha:]]//g')
+        if [[ $line =~ $re ]]; then token=${BASH_REMATCH[1]}; fi
+    done <<<"$logs"
+    printf '%s' "$token"
+}
+
+# docker run возвращается раньше, чем процесс успевает записать токен.
+PORTAINER_TOKEN_TRIES=20
+portainer_read_setup_token() {
+    local i logs token
+    for (( i=0; i<${PORTAINER_TOKEN_TRIES}; i++ )); do
+        logs=$(docker logs portainer 2>&1) || logs=""
+        token=$(portainer_token_from_logs "$logs")
+        if [[ -n $token ]]; then
+            printf '%s' "$token"
+            return 0
+        fi
+        if (( i == 0 )); then
+            # На stdout функции — только сам токен: его забирают в переменную.
+            info "Жду, пока Portainer запишет токен первой учётки в лог..." >&2
+        fi
+        (( i + 1 < ${PORTAINER_TOKEN_TRIES} )) && sleep 1
+    done
+    return 1
+}
+
+portainer_token_text() {
+    local token=${1:-}
+    if [[ -n $token ]]; then
+        echo "Токен первой учётки: ${BLD}${token}${RST}"
+        echo "Этот токен надо вставить при создании первой учётки Portainer."
+    else
+        warn "Токен первой учётки в логах контейнера не найден."
+        warn "Ищи строку setup_token= в выводе: docker logs portainer"
+    fi
+}
+
 # Portainer не умеет обновлять сам себя: образ надо стянуть заново и
 # пересоздать контейнер. Тома portainer_data это не трогает, настройки и
 # пользователи остаются на месте.
@@ -1752,6 +1801,8 @@ portainer_update() {
 
 PORTAINER_URL=""
 PORTAINER_EDGE=0
+PORTAINER_TOKEN=""
+PORTAINER_TOKEN_MISSING=0
 mod_portainer() {
     command -v docker &>/dev/null || { err "Docker не установлен — Portainer ставить некуда."; return 1; }
     if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx portainer; then
@@ -1773,11 +1824,19 @@ mod_portainer() {
             err "Не удалось запустить Portainer."; return 1
         fi
         ok "Portainer запущен."
+        if PORTAINER_TOKEN=$(portainer_read_setup_token); then
+            PORTAINER_TOKEN_MISSING=0
+        else
+            PORTAINER_TOKEN=""
+            PORTAINER_TOKEN_MISSING=1
+        fi
         echo
         echo "${YLW}${BLD}Не откладывай:${RST} ${YLW}открой панель и заведи администратора"
         echo "в ближайшие ${BLD}пять минут${RST}${YLW}. Если не успеть, Portainer закроет"
         echo "себя из соображений безопасности и напишет «timed out» —"
         echo "тогда его надо перезапустить этим же пунктом меню (данные целы).${RST}"
+        echo
+        portainer_token_text "$PORTAINER_TOKEN"
     fi
     # ufw_want сам решит: открыть сейчас или передать модулю Firewall,
     # если UFW ещё не включён (он в списке идёт позже).
@@ -4260,6 +4319,8 @@ run_selected() {
     # включения firewall, и разбирает модуль Firewall, возможно в другом заходе.
     PORTAINER_EDGE=0
     PORTAINER_URL=""
+    PORTAINER_TOKEN=""
+    PORTAINER_TOKEN_MISSING=0
     clear
     for k in "${ORDER[@]}"; do
         [[ ${SEL[$k]} == 1 ]] || continue
@@ -4290,6 +4351,11 @@ run_selected() {
     fi
     echo
     [[ -n ${PORTAINER_URL:-} ]] && echo "Portainer: ${BLD}${PORTAINER_URL}${RST}"
+    if [[ -n ${PORTAINER_TOKEN:-} ]]; then
+        portainer_token_text "$PORTAINER_TOKEN"
+    elif (( ${PORTAINER_TOKEN_MISSING:-0} )); then
+        portainer_token_text ""
+    fi
     # Очередь портов разбирает модуль Firewall. Если его не выбрали, заявки
     # так и остались бы висеть молча — говорим об этом прямо.
     if (( ${#PENDING_PORTS[@]} )); then
